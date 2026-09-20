@@ -43,6 +43,29 @@ CREATE TABLE IF NOT EXISTS merge_drafts (
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
+
+-- Append-only adjudication audit trail. One row per successful state
+-- change of a merge order, chained per merge: hash = SHA-256 of the
+-- canonical JSON of the event payload, which includes the previous
+-- event's hash (NULL for the merge's first event).
+CREATE TABLE IF NOT EXISTS merge_audit_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    merge_id        TEXT NOT NULL REFERENCES merges (id),
+    seq             INTEGER NOT NULL,
+    method          TEXT NOT NULL CHECK (method IN (
+        'resolutions', 'rule-resolutions', 'reuse-resolutions', 'draft-commit'
+    )),
+    revision_before INTEGER NOT NULL,
+    revision_after  INTEGER NOT NULL,
+    -- JSON array of the JSON Pointers that actually took effect.
+    pointers        TEXT NOT NULL,
+    -- JSON object with method-specific context (e.g. source_merge_id).
+    detail          TEXT NOT NULL,
+    prev_hash       TEXT,
+    hash            TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    UNIQUE (merge_id, seq)
+);
 """
 
 
@@ -109,3 +132,8 @@ def transaction():
 def query_one(query: str, params: tuple = ()) -> sqlite3.Row | None:
     with _lock:
         return connect().execute(query, params).fetchone()
+
+
+def query_all(query: str, params: tuple = ()) -> list[sqlite3.Row]:
+    with _lock:
+        return connect().execute(query, params).fetchall()

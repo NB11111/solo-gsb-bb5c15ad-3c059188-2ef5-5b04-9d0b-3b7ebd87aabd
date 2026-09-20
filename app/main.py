@@ -201,6 +201,24 @@ def get_merge_patch(merge_id: str):
     return store.get_merge_patch(merge_id)
 
 
+@app.get("/merges/{merge_id}/audit")
+def get_merge_audit(merge_id: str):
+    """Adjudication audit trail of the merge, in chain order.
+
+    Every successful resolutions / rule-resolutions / reuse-resolutions /
+    draft-commit request appended exactly one event (revision before/after,
+    adjudication method, effective JSON Pointers) inside the same SQLite
+    transaction as the merge update; failed requests and zero-match no-ops
+    left no event. Events are chained per merge: each event's hash is the
+    SHA-256 of its canonical-JSON payload, which includes the previous
+    event's hash (null for the first). The response replays the chain and
+    reports ``chain_valid`` plus ``first_bad_seq`` — the sequence number of
+    the first event whose sequence, linkage or hash fails verification
+    (null when the chain is intact). Unknown merge: 404.
+    """
+    return store.get_merge_audit(merge_id)
+
+
 def _resolution_items(body: ResolveRequest | DraftUpdateRequest) -> list[dict]:
     return [
         {

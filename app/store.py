@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from . import db, rules
+from . import audit, db, rules
 from .merge import MISSING, delete_at, merge3, parse_pointer, set_at
 from .patch import generate_patch, sha256_hex
 from .reuse import (
@@ -124,6 +124,28 @@ def get_merge_patch(merge_id: str) -> dict:
         "patch": generate_patch(base, result),
         "base_sha256": sha256_hex(base),
         "result_sha256": sha256_hex(result),
+    }
+
+
+def get_merge_audit(merge_id: str) -> dict:
+    """Return the merge's adjudication audit trail with chain verification.
+
+    Events are listed in chain order (seq ascending). ``chain_valid``
+    replays the per-merge SHA-256 chain over the stored events; when it is
+    False, ``first_bad_seq`` names the sequence number of the first event
+    whose sequence, linkage or hash does not verify (None otherwise).
+    """
+    row = db.query_one("SELECT id FROM merges WHERE id = ?", (merge_id,))
+    if row is None:
+        raise MergeNotFound(merge_id)
+    events = audit.list_events(merge_id)
+    chain_valid, first_bad_seq = audit.verify_chain(events)
+    return {
+        "merge_id": merge_id,
+        "event_count": len(events),
+        "chain_valid": chain_valid,
+        "first_bad_seq": first_bad_seq,
+        "events": [audit.event_view(event) for event in events],
     }
 
 
@@ -266,23 +288,34 @@ def apply_resolutions(
     # carries conflict placeholders and is committed unchecked.
     if resolved and row["result_schema"] is not None:
         validate_result(json.loads(row["result_schema"]), document)
-    db.execute(
-        """
-        UPDATE merges
-        SET status = ?, revision = revision + 1, document = ?,
-            conflicts = ?, result = ?, updated_at = ?
-        WHERE id = ?
-        """,
-        (
-            STATUS_RESOLVED if resolved else STATUS_PENDING,
-            json.dumps(document),
-            json.dumps(remaining),
-            # Once written the result is never updated again: immutable.
-            json.dumps(document) if resolved else None,
-            _now(),
+    # The merge update and its audit event commit in one transaction:
+    # a state change never persists without its adjudication record.
+    with db.transaction() as conn:
+        conn.execute(
+            """
+            UPDATE merges
+            SET status = ?, revision = revision + 1, document = ?,
+                conflicts = ?, result = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                STATUS_RESOLVED if resolved else STATUS_PENDING,
+                json.dumps(document),
+                json.dumps(remaining),
+                # Once written the result is never updated again: immutable.
+                json.dumps(document) if resolved else None,
+                _now(),
+                merge_id,
+            ),
+        )
+        audit.append_event(
+            conn,
             merge_id,
-        ),
-    )
+            audit.METHOD_RESOLUTIONS,
+            row["revision"],
+            row["revision"] + 1,
+            [item["pointer"] for item in resolutions],
+        )
     return get_merge(merge_id)
 
 
@@ -373,23 +406,34 @@ def apply_rule_resolutions(
     if resolved and row["result_schema"] is not None:
         validate_result(json.loads(row["result_schema"]), document)
 
-    # Single atomic update: revision increments exactly once.
-    db.execute(
-        """
-        UPDATE merges
-        SET status = ?, revision = revision + 1, document = ?,
-            conflicts = ?, result = ?, updated_at = ?
-        WHERE id = ?
-        """,
-        (
-            STATUS_RESOLVED if resolved else STATUS_PENDING,
-            json.dumps(document),
-            json.dumps(remaining),
-            json.dumps(document) if resolved else None,
-            _now(),
+    # Single atomic update: revision increments exactly once, and the
+    # audit event is appended in the same transaction.
+    with db.transaction() as conn:
+        conn.execute(
+            """
+            UPDATE merges
+            SET status = ?, revision = revision + 1, document = ?,
+                conflicts = ?, result = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                STATUS_RESOLVED if resolved else STATUS_PENDING,
+                json.dumps(document),
+                json.dumps(remaining),
+                json.dumps(document) if resolved else None,
+                _now(),
+                merge_id,
+            ),
+        )
+        audit.append_event(
+            conn,
             merge_id,
-        ),
-    )
+            audit.METHOD_RULES,
+            row["revision"],
+            row["revision"] + 1,
+            # apply_plan applies winners in ascending pointer order.
+            sorted(winner.pointer for winner in winners),
+        )
     view = get_merge(merge_id)
     view["rule_matches"] = rule_matches
     view["unmatched_conflicts"] = unmatched
@@ -493,6 +537,17 @@ def reuse_resolutions(
                     _now(),
                     merge_id,
                 ),
+            )
+            # Same transaction as the merge update; a zero-match reuse
+            # writes nothing and leaves no event.
+            audit.append_event(
+                conn,
+                merge_id,
+                audit.METHOD_REUSE,
+                row["revision"],
+                row["revision"] + 1,
+                [match.pointer for match in matches],
+                detail={"source_merge_id": source_merge_id},
             )
             applied = True
 
@@ -746,6 +801,16 @@ def commit_draft(merge_id: str, draft_id: str) -> dict:
         conn.execute(
             "UPDATE merge_drafts SET status = ?, updated_at = ? WHERE id = ?",
             (DRAFT_COMMITTED, now, draft_id),
+        )
+        # Same transaction as the merge update and draft invalidation.
+        audit.append_event(
+            conn,
+            merge_id,
+            audit.METHOD_DRAFT_COMMIT,
+            merge_row["revision"],
+            merge_row["revision"] + 1,
+            list(stored.keys()),
+            detail={"draft_id": draft_id},
         )
     view = get_merge(merge_id)
     view["draft_id"] = draft_id
