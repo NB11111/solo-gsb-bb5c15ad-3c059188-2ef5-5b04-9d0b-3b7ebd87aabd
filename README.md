@@ -52,6 +52,7 @@ SQLite 数据文件持久化在名为 `merge-data` 的 Docker volume 中（容�
 | `GET` | `/merges/{merge_id}/drafts/{draft_id}/preview` | 草案预演：应用草案后的文档与剩余冲突，不落库 |
 | `POST` | `/merges/{merge_id}/drafts/{draft_id}/commit` | 单事务提交草案：重校验后一次性应用全部取值并使草案失效 |
 | `GET` | `/merges/{merge_id}/patch` | resolved 后：base → result 的 RFC 6902 补丁（含 SHA-256） |
+| `GET` | `/merges/{merge_id}/audit` | 裁决审计链：按序返回全部裁决事件及逐合并单 SHA-256 链校验结果 |
 | `GET` | `/health` | 健康检查 |
 
 ### 1. 创建合并单 — `POST /merges`
@@ -435,13 +436,79 @@ curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/patch
 - 合并单不存在 → **`404`**。
 - 无冲突、创建即 `resolved` 的合并单可立即获取补丁（无变化时 `patch` 为 `[]`）。
 
+### 9. 裁决审计链 — `GET /merges/{merge_id}/audit`
+
+每一次**成功改变合并单**的裁决请求——`resolutions`、`rule-resolutions`、`reuse-resolutions` 或草案 `commit`——都会在**与合并单更新相同的 SQLite 事务**内追加一条审计事件：事件与状态变更同事务提交或回滚，因此失败请求（`400` / `409` / `422`）、预演接口、草案编辑，以及零命中的规则裁决 / 历史复用（`applied: false`）都**不会留下任何事件**。
+
+每条事件记录：
+
+| 字段 | 说明 |
+| --- | --- |
+| `seq` | 合并单内单调递增的事件序号（从 1 开始） |
+| `method` | 裁决方式：`resolutions` / `rule-resolutions` / `reuse-resolutions` / `draft-commit` |
+| `revision_before` / `revision_after` | 事件前后的 merge revision |
+| `pointers` | 实际生效的 JSON Pointer（按应用顺序） |
+| `detail` | 方式相关的裁决明细（逐指针的 choice/value 或 side/rule_index、复用来源 `source_merge_id`、草案 `draft_id`） |
+| `prev_hash` / `hash` | SHA-256 链：见下 |
+| `created_at` | 事件时间（UTC ISO 8601） |
+| `valid` | 本次链校验中该事件是否通过 |
+
+**哈希链构造**（逐合并单一条链）：`hash = SHA-256(规范化JSON(事件内容))`，规范化 JSON 与文档摘要一致（键排序、无空白）；事件内容包含上一事件的 `hash`（`prev_hash`），每个合并单的首条事件以 64 个 `0` 作为创世 `prev_hash`。任何对历史事件的篡改或删除都会使链条在确定的位置断裂。
+
+**链校验**：接口按 `seq` 顺序重放全部事件，逐条用库存字段重算哈希并检查序号连续性与 `prev_hash` 衔接，返回整体结论；链断裂时 `first_invalid_seq` 明确指出**首个异常事件的序号**（链完好时为 `null`）。
+
+```bash
+curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/audit
+```
+
+响应示例（先经 `resolutions` 解决 `/db/host`，再经 `rule-resolutions` 解决 `/db/port`）：
+
+```json
+{
+  "merge_id": "bc6d2c3d9a3343bf9177147a10ec4023",
+  "event_count": 2,
+  "events": [
+    {
+      "seq": 1,
+      "method": "resolutions",
+      "revision_before": 1,
+      "revision_after": 2,
+      "pointers": ["/db/host"],
+      "detail": {"items": [{"pointer": "/db/host", "choice": "left"}]},
+      "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "hash": "3d25…（64 位十六进制）",
+      "created_at": "2026-09-20T03:36:35.598099+00:00",
+      "valid": true
+    },
+    {
+      "seq": 2,
+      "method": "rule-resolutions",
+      "revision_before": 2,
+      "revision_after": 3,
+      "pointers": ["/db/port"],
+      "detail": {"items": [{"pointer": "/db/port", "side": "right", "rule_index": 0}]},
+      "prev_hash": "3d25…",
+      "hash": "7943…",
+      "created_at": "2026-09-20T03:36:35.631001+00:00",
+      "valid": true
+    }
+  ],
+  "chain_valid": true,
+  "first_invalid_seq": null
+}
+```
+
+- 从未成功裁决过的合并单返回空链：`events: []`、`chain_valid: true`。
+- 合并单不存在 → **`404`**。
+- 既有接口的响应体不因审计模块增加任何字段，完全保持兼容。
+
 ## 本地开发与测试
 
 ```bash
 pip install -r requirements.txt
 pip install httpx pytest
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（121 项）
+python -m pytest tests/ -q                  # 运行测试（140 项）
 ```
 
 ## 项目结构
@@ -454,10 +521,11 @@ app/
   reuse.py      # 历史裁决复用：指针 + base/left/right/missing 规范化匹配、来源结果取值/删除
   patch.py      # 确定性 RFC 6902 补丁生成 + 规范化 SHA-256
   validation.py # Draft 2020-12 结果门禁：元 schema 校验 + 最终结果校验（422 错误排序）
+  audit.py      # 裁决审计：同事务事件追加 + 逐合并单 SHA-256 哈希链校验
   store.py      # 合并单状态机 + 解决草案 + 历史复用：revision 校验、冲突解决、不可变结果、schema 门禁
   db.py         # SQLite 连接与建表（启动时执行，含轻量列迁移与单事务提交支持）
   models.py     # Pydantic 请求模型（含可选 result_schema、草案编辑、历史复用请求）
-tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁、草案与历史复用测试）
+tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁、草案、历史复用与审计链测试）
 Dockerfile
 docker-compose.yml
 requirements.txt

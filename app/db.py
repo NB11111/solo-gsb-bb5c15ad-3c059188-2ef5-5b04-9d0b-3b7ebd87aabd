@@ -43,6 +43,25 @@ CREATE TABLE IF NOT EXISTS merge_drafts (
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
+
+-- Adjudication audit trail: one row per successful state-changing
+-- resolution request, chained per merge order via prev_hash/hash.
+CREATE TABLE IF NOT EXISTS merge_audit_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    merge_id        TEXT NOT NULL REFERENCES merges (id),
+    seq             INTEGER NOT NULL,
+    method          TEXT NOT NULL CHECK (method IN (
+        'resolutions', 'rule-resolutions', 'reuse-resolutions', 'draft-commit'
+    )),
+    revision_before INTEGER NOT NULL,
+    revision_after  INTEGER NOT NULL,
+    pointers        TEXT NOT NULL,
+    detail          TEXT NOT NULL,
+    prev_hash       TEXT NOT NULL,
+    hash            TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    UNIQUE (merge_id, seq)
+);
 """
 
 
@@ -109,3 +128,8 @@ def transaction():
 def query_one(query: str, params: tuple = ()) -> sqlite3.Row | None:
     with _lock:
         return connect().execute(query, params).fetchone()
+
+
+def query_all(query: str, params: tuple = ()) -> list[sqlite3.Row]:
+    with _lock:
+        return connect().execute(query, params).fetchall()

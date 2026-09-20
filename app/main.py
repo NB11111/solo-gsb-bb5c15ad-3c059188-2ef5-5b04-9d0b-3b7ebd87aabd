@@ -201,6 +201,22 @@ def get_merge_patch(merge_id: str):
     return store.get_merge_patch(merge_id)
 
 
+@app.get("/merges/{merge_id}/audit")
+def get_merge_audit(merge_id: str):
+    """Adjudication audit trail of the merge order, in sequence order.
+
+    Every successful resolutions / rule-resolutions / reuse-resolutions /
+    draft-commit request appended exactly one event inside the same
+    transaction as the merge update; failed requests and zero-match no-ops
+    left none. Each event records the method, the revision before/after
+    and the JSON Pointers that took effect, and is chained to its
+    predecessor via SHA-256 over canonical JSON. The response re-verifies
+    the whole chain and, when it is broken, names the first anomalous
+    sequence number. Unknown merge: 404.
+    """
+    return store.get_audit_trail(merge_id)
+
+
 def _resolution_items(body: ResolveRequest | DraftUpdateRequest) -> list[dict]:
     return [
         {

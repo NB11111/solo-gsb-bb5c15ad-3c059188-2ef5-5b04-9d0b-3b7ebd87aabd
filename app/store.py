@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from . import db, rules
+from . import audit, db, rules
 from .merge import MISSING, delete_at, merge3, parse_pointer, set_at
 from .patch import generate_patch, sha256_hex
 from .reuse import (
@@ -127,6 +127,19 @@ def get_merge_patch(merge_id: str) -> dict:
     }
 
 
+def get_audit_trail(merge_id: str) -> dict:
+    """Return the merge order's adjudication audit trail and chain verdict.
+
+    Events are returned in sequence order, each re-verified against the
+    per-merge SHA-256 chain; the response reports whether the whole chain
+    verifies and, when it does not, the first anomalous sequence number.
+    Raises MergeNotFound (404) for an unknown merge.
+    """
+    if db.query_one("SELECT id FROM merges WHERE id = ?", (merge_id,)) is None:
+        raise MergeNotFound(merge_id)
+    return audit.get_audit_trail(merge_id)
+
+
 def create_merge(
     base: Any,
     left: Any,
@@ -241,6 +254,23 @@ def _apply_batch(
     return document, remaining
 
 
+def _resolution_detail_items(resolutions: list[dict]) -> list[dict]:
+    """Compact per-pointer record of what a resolution batch decided.
+
+    Mirrors the choice/value semantics of the batch items: an explicit
+    null ``value`` is preserved as ``{"value": null}``.
+    """
+    items = []
+    for item in resolutions:
+        entry = {"pointer": item["pointer"]}
+        if item.get("choice") is not None:
+            entry["choice"] = item["choice"]
+        else:
+            entry["value"] = item["value"]
+        items.append(entry)
+    return items
+
+
 def apply_resolutions(
     merge_id: str, expected_revision: int, resolutions: list[dict]
 ) -> dict:
@@ -248,41 +278,57 @@ def apply_resolutions(
 
     Raises StaleRevision (409) if expected_revision does not match the
     current revision, and AlreadyResolved (409) once the result is final.
+    A successful batch appends one audit event inside the same transaction
+    as the merge update; a rejected batch leaves neither.
     """
-    row = db.query_one("SELECT * FROM merges WHERE id = ?", (merge_id,))
-    if row is None:
-        raise MergeNotFound(merge_id)
-    if row["status"] == STATUS_RESOLVED:
-        raise AlreadyResolved(merge_id)
-    if row["revision"] != expected_revision:
-        raise StaleRevision(row["revision"])
+    with db.transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM merges WHERE id = ?", (merge_id,)
+        ).fetchone()
+        if row is None:
+            raise MergeNotFound(merge_id)
+        if row["status"] == STATUS_RESOLVED:
+            raise AlreadyResolved(merge_id)
+        if row["revision"] != expected_revision:
+            raise StaleRevision(row["revision"])
 
-    document, remaining = _apply_batch(
-        json.loads(row["document"]), json.loads(row["conflicts"]), resolutions
-    )
-    resolved = not remaining
-    # Gate: only a batch that resolves the last conflict produces a final
-    # document, so only that batch is validated. A partial batch still
-    # carries conflict placeholders and is committed unchecked.
-    if resolved and row["result_schema"] is not None:
-        validate_result(json.loads(row["result_schema"]), document)
-    db.execute(
-        """
-        UPDATE merges
-        SET status = ?, revision = revision + 1, document = ?,
-            conflicts = ?, result = ?, updated_at = ?
-        WHERE id = ?
-        """,
-        (
-            STATUS_RESOLVED if resolved else STATUS_PENDING,
-            json.dumps(document),
-            json.dumps(remaining),
-            # Once written the result is never updated again: immutable.
-            json.dumps(document) if resolved else None,
-            _now(),
+        document, remaining = _apply_batch(
+            json.loads(row["document"]), json.loads(row["conflicts"]), resolutions
+        )
+        resolved = not remaining
+        # Gate: only a batch that resolves the last conflict produces a final
+        # document, so only that batch is validated. A partial batch still
+        # carries conflict placeholders and is committed unchecked.
+        if resolved and row["result_schema"] is not None:
+            validate_result(json.loads(row["result_schema"]), document)
+        conn.execute(
+            """
+            UPDATE merges
+            SET status = ?, revision = revision + 1, document = ?,
+                conflicts = ?, result = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                STATUS_RESOLVED if resolved else STATUS_PENDING,
+                json.dumps(document),
+                json.dumps(remaining),
+                # Once written the result is never updated again: immutable.
+                json.dumps(document) if resolved else None,
+                _now(),
+                merge_id,
+            ),
+        )
+        # Same transaction as the merge update: the audit event commits or
+        # rolls back together with the state change it describes.
+        audit.record_event(
+            conn,
             merge_id,
-        ),
-    )
+            audit.METHOD_RESOLUTIONS,
+            row["revision"],
+            row["revision"] + 1,
+            [item["pointer"] for item in resolutions],
+            {"items": _resolution_detail_items(resolutions)},
+        )
     return get_merge(merge_id)
 
 
@@ -339,61 +385,85 @@ def apply_rule_resolutions(
     order) supplies its side. All hits are validated before any write: an
     invalid pattern, a rule without any pattern or a failure applying a
     hit rejects the whole request with no partial modification. The
-    revision is bumped at most once, inside the single UPDATE transaction.
+    revision is bumped at most once, inside the single transaction that
+    also appends the audit event; a run that matched nothing writes
+    nothing and leaves no event.
     """
-    row = db.query_one("SELECT * FROM merges WHERE id = ?", (merge_id,))
-    if row is None:
-        raise MergeNotFound(merge_id)
-    if row["status"] == STATUS_RESOLVED:
-        raise AlreadyResolved(merge_id)
-    if row["revision"] != expected_revision:
-        raise StaleRevision(row["revision"])
+    with db.transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM merges WHERE id = ?", (merge_id,)
+        ).fetchone()
+        if row is None:
+            raise MergeNotFound(merge_id)
+        if row["status"] == STATUS_RESOLVED:
+            raise AlreadyResolved(merge_id)
+        if row["revision"] != expected_revision:
+            raise StaleRevision(row["revision"])
 
-    # Compiling and planning happens entirely in memory; nothing is touched
-    # until every selected conflict has been proven applicable.
-    compiled_rules = compile_rules(rule_items)
-    conflicts = json.loads(row["conflicts"])
-    winners = plan_resolutions(conflicts, compiled_rules)
-    rule_matches = group_matches(winners)
-    unmatched = [c["pointer"] for c in conflicts if c["pointer"] not in {w.pointer for w in winners}]
+        # Compiling and planning happens entirely in memory; nothing is
+        # touched until every selected conflict has been proven applicable.
+        compiled_rules = compile_rules(rule_items)
+        conflicts = json.loads(row["conflicts"])
+        winners = plan_resolutions(conflicts, compiled_rules)
+        rule_matches = group_matches(winners)
+        unmatched = [c["pointer"] for c in conflicts if c["pointer"] not in {w.pointer for w in winners}]
 
-    if not winners:
-        # Nothing matched: nothing to validate or apply, no state change and
-        # no revision bump; the unmatched conflicts are reported back.
-        view = get_merge(merge_id)
-        view["rule_matches"] = []
-        view["unmatched_conflicts"] = unmatched
-        view["applied"] = False
-        return view
+        applied = False
+        if winners:
+            document, remaining = apply_plan(json.loads(row["document"]), conflicts, winners)
+            resolved = not remaining
+            # Same gate as explicit resolutions: only the batch that resolves
+            # the very last conflict is checked against the final-result schema.
+            if resolved and row["result_schema"] is not None:
+                validate_result(json.loads(row["result_schema"]), document)
 
-    document, remaining = apply_plan(json.loads(row["document"]), conflicts, winners)
-    resolved = not remaining
-    # Same gate as explicit resolutions: only the batch that resolves the
-    # very last conflict is checked against the final-result schema.
-    if resolved and row["result_schema"] is not None:
-        validate_result(json.loads(row["result_schema"]), document)
+            # Single atomic update: revision increments exactly once.
+            conn.execute(
+                """
+                UPDATE merges
+                SET status = ?, revision = revision + 1, document = ?,
+                    conflicts = ?, result = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    STATUS_RESOLVED if resolved else STATUS_PENDING,
+                    json.dumps(document),
+                    json.dumps(remaining),
+                    json.dumps(document) if resolved else None,
+                    _now(),
+                    merge_id,
+                ),
+            )
+            # Winners apply in sorted pointer order (see apply_plan); the
+            # event records that same effective order.
+            ordered = sorted(winners, key=lambda w: w.pointer)
+            audit.record_event(
+                conn,
+                merge_id,
+                audit.METHOD_RULE_RESOLUTIONS,
+                row["revision"],
+                row["revision"] + 1,
+                [w.pointer for w in ordered],
+                {
+                    "items": [
+                        {
+                            "pointer": w.pointer,
+                            "side": w.side,
+                            "rule_index": w.rule_index,
+                        }
+                        for w in ordered
+                    ]
+                },
+            )
+            applied = True
+        # Nothing matched: nothing to validate or apply, no state change,
+        # no revision bump and no audit event; the unmatched conflicts are
+        # reported back below.
 
-    # Single atomic update: revision increments exactly once.
-    db.execute(
-        """
-        UPDATE merges
-        SET status = ?, revision = revision + 1, document = ?,
-            conflicts = ?, result = ?, updated_at = ?
-        WHERE id = ?
-        """,
-        (
-            STATUS_RESOLVED if resolved else STATUS_PENDING,
-            json.dumps(document),
-            json.dumps(remaining),
-            json.dumps(document) if resolved else None,
-            _now(),
-            merge_id,
-        ),
-    )
     view = get_merge(merge_id)
     view["rule_matches"] = rule_matches
     view["unmatched_conflicts"] = unmatched
-    view["applied"] = True
+    view["applied"] = applied
     return view
 
 
@@ -493,6 +563,20 @@ def reuse_resolutions(
                     _now(),
                     merge_id,
                 ),
+            )
+            # Same transaction as the merge update; a zero-match reuse
+            # reaches no UPDATE and therefore records no event.
+            audit.record_event(
+                conn,
+                merge_id,
+                audit.METHOD_REUSE_RESOLUTIONS,
+                row["revision"],
+                row["revision"] + 1,
+                [match.pointer for match in matches],
+                {
+                    "source_merge_id": source_merge_id,
+                    "items": [match_to_view(match) for match in matches],
+                },
             )
             applied = True
 
@@ -746,6 +830,19 @@ def commit_draft(merge_id: str, draft_id: str) -> dict:
         conn.execute(
             "UPDATE merge_drafts SET status = ?, updated_at = ? WHERE id = ?",
             (DRAFT_COMMITTED, now, draft_id),
+        )
+        # Same transaction as the merge update and the draft invalidation.
+        audit.record_event(
+            conn,
+            merge_id,
+            audit.METHOD_DRAFT_COMMIT,
+            merge_row["revision"],
+            merge_row["revision"] + 1,
+            list(stored.keys()),
+            {
+                "draft_id": draft_id,
+                "items": _resolution_detail_items(_stored_to_batch(stored)),
+            },
         )
     view = get_merge(merge_id)
     view["draft_id"] = draft_id
