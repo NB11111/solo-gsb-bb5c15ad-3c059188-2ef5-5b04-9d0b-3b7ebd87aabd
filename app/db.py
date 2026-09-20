@@ -1,0 +1,111 @@
+"""SQLite persistence. Schema is created on application startup."""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import threading
+from contextlib import contextmanager
+
+DATABASE_PATH = os.environ.get("DATABASE_PATH", "./merges.db")
+
+_lock = threading.Lock()
+_conn: sqlite3.Connection | None = None
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS merges (
+    id              TEXT PRIMARY KEY,
+    idempotency_key TEXT UNIQUE,
+    status          TEXT NOT NULL CHECK (status IN ('pending', 'resolved')),
+    revision        INTEGER NOT NULL,
+    base_doc        TEXT NOT NULL,
+    left_doc        TEXT NOT NULL,
+    right_doc       TEXT NOT NULL,
+    document        TEXT NOT NULL,
+    conflicts       TEXT NOT NULL,
+    -- Conflict snapshot as first recorded, preserved across resolutions
+    -- so later merges can reuse this order's historical adjudications.
+    source_conflicts TEXT,
+    result          TEXT,
+    result_schema   TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS merge_drafts (
+    id              TEXT PRIMARY KEY,
+    merge_id        TEXT NOT NULL REFERENCES merges (id),
+    status          TEXT NOT NULL CHECK (status IN ('open', 'committed')),
+    base_revision   INTEGER NOT NULL,
+    document        TEXT NOT NULL,
+    conflicts       TEXT NOT NULL,
+    resolutions     TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+"""
+
+
+def connect() -> sqlite3.Connection:
+    global _conn
+    if _conn is None:
+        directory = os.path.dirname(os.path.abspath(DATABASE_PATH))
+        os.makedirs(directory, exist_ok=True)
+        _conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        _conn.row_factory = sqlite3.Row
+        _conn.execute("PRAGMA journal_mode=WAL")
+        _conn.execute("PRAGMA foreign_keys=ON")
+    return _conn
+
+
+# Objects created after the initial release; applied to database files that
+# predate them so an existing Docker volume keeps working. The merge_drafts
+# table is part of SCHEMA above (CREATE TABLE IF NOT EXISTS runs on every
+# startup); only column-level changes need an ALTER here. Each entry pairs
+# the statement with the column it adds, for an idempotent existence check.
+_MIGRATIONS = (
+    ("ALTER TABLE merges ADD COLUMN result_schema TEXT", "result_schema"),
+    ("ALTER TABLE merges ADD COLUMN source_conflicts TEXT", "source_conflicts"),
+)
+
+
+def init_schema() -> None:
+    with _lock:
+        conn = connect()
+        conn.executescript(SCHEMA)
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(merges)")}
+        for statement, column in _MIGRATIONS:
+            if column not in existing:
+                conn.execute(statement)
+        conn.commit()
+
+
+def execute(query: str, params: tuple = ()) -> sqlite3.Cursor:
+    with _lock:
+        cur = connect().execute(query, params)
+        connect().commit()
+        return cur
+
+
+@contextmanager
+def transaction():
+    """Run a read/check/write sequence as one atomic transaction.
+
+    The global lock is held for the whole block, so rows read inside cannot
+    change underneath the caller; any exception rolls everything back and
+    nothing is partially written.
+    """
+    with _lock:
+        conn = connect()
+        try:
+            yield conn
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+
+
+def query_one(query: str, params: tuple = ()) -> sqlite3.Row | None:
+    with _lock:
+        return connect().execute(query, params).fetchone()
